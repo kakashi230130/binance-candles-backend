@@ -100,7 +100,7 @@ export function runBacktest({
   riskPerTrade = 0.01,
   leverage = 10,
   feeRate = 0.0004,
-  slippagePct = 0.0002, // Đặt mặc định slippage 0.02%
+  slippagePct = 0.0002, 
   data, 
   indicatorsFromDb = true,
   debug = false,
@@ -244,8 +244,10 @@ export function runBacktest({
             open.ptp = {
               R,
               partialDone: false,
-              partialPrice: open.side === 'LONG' ? (open.entryFill + R) : (open.entryFill - R),
-              finalPrice: open.side === 'LONG' ? (open.entryFill + 2 * R) : (open.entryFill - 2 * R),
+              // CẬP NHẬT: Chốt 50% ở mốc +1.5R thay vì +1R
+              partialPrice: open.side === 'LONG' ? (open.entryFill + 1.5 * R) : (open.entryFill - 1.5 * R),
+              // CẬP NHẬT: Đích đến cuối cùng là +3R
+              finalPrice: open.side === 'LONG' ? (open.entryFill + 3 * R) : (open.entryFill - 3 * R),
               accumulatedGross: 0,
               accumulatedFees: 0,
             };
@@ -270,17 +272,18 @@ export function runBacktest({
               open.qty -= closeQty;
               open.ptp.partialDone = true;
 
-              const feeBuf = open.entryFill * clamp(feeRate, 0, 0.01) * 2;
-              const be = open.side === 'LONG' ? (open.entryFill + feeBuf) : (open.entryFill - feeBuf);
-              open.currentSl = be;
+              // CẬP NHẬT: Khóa lãi +0.5R thay vì chỉ về hòa vốn (BE). Đảm bảo 50% còn lại nếu dính SL vẫn có tiền.
+              const lockProfit = 0.5 * open.ptp.R;
+              const trailSL = open.side === 'LONG' ? (open.entryFill + lockProfit) : (open.entryFill - lockProfit);
+              open.currentSl = trailSL;
             }
           }
 
           if (open && open.ptp?.partialDone) {
-            // CẬP NHẬT: Trailing Stop cho 50% còn lại. Nếu giá chạy được > 1.5R thì dời SL lên khóa lãi +0.5R
+            // CẬP NHẬT: Khóa lãi bậc 2. Nếu giá chạy được > 2R thì dời SL lên khóa lãi ở +1R
             const favorable = open.side === 'LONG' ? (c5.high - open.entryFill) : (open.entryFill - c5.low);
-            if (favorable >= 1.5 * open.ptp.R) {
-              const trailPrice = open.side === 'LONG' ? (open.entryFill + 0.5 * open.ptp.R) : (open.entryFill - 0.5 * open.ptp.R);
+            if (favorable >= 2 * open.ptp.R) {
+              const trailPrice = open.side === 'LONG' ? (open.entryFill + 1 * open.ptp.R) : (open.entryFill - 1 * open.ptp.R);
               if (open.side === 'LONG') open.currentSl = Math.max(open.currentSl, trailPrice);
               else open.currentSl = Math.min(open.currentSl, trailPrice);
             }
@@ -309,7 +312,7 @@ export function runBacktest({
                 sl_initial: open.initialSl,
                 sl_final: open.currentSl,
                 tp: open.ptp.finalPrice,
-                reason: 'TP_2R_AFTER_PTP',
+                reason: 'TP_MAX_AFTER_PTP', // Đổi tên reason để dễ nhận biết
                 grossPnl: open.ptp.accumulatedGross + gross,
                 fees: open.fees + open.ptp.accumulatedFees + feeOut,
                 netPnl: (open.ptp.accumulatedGross + gross) - (open.fees + open.ptp.accumulatedFees + feeOut),
