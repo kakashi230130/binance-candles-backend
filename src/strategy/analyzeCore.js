@@ -39,6 +39,70 @@ function inMaZone(c, pct = 0.006) {
   return near20or50 || near200;
 }
 
+function isPullbackReversalCandle({ bias, candles15, candles30 }) {
+  const m15 = candles15?.at(-1) ?? null;
+  const m15p = candles15?.at(-2) ?? null;
+  const m30 = candles30?.at(-1) ?? null;
+  const m30p = candles30?.at(-2) ?? null;
+
+  if (bias === 'BUY') {
+    const bullEngulf = isBullishEngulfing(m15p, m15) || isBullishEngulfing(m30p, m30);
+    const hammer = isHammerLike(m15) || isHammerLike(m30);
+    return { ok: bullEngulf || hammer, why: bullEngulf ? 'BULL_ENGULF' : (hammer ? 'HAMMER' : 'NO_REVERSAL') };
+  }
+  if (bias === 'SELL') {
+    const bearEngulf = isBearishEngulfing(m15p, m15) || isBearishEngulfing(m30p, m30);
+    const star = isShootingStarLike(m15) || isShootingStarLike(m30);
+    return { ok: bearEngulf || star, why: bearEngulf ? 'BEAR_ENGULF' : (star ? 'SHOOTING_STAR' : 'NO_REVERSAL') };
+  }
+  return { ok: false, why: 'BIAS_WAIT' };
+}
+
+function isEntrySignalPullback({ bias, candles30, candles15, candles5 }) {
+  // New strategy requested: PULLBACK_STRATEGY
+  // Spec:
+  // - HTF trend (4H/1H) must align strongly (bias already derived outside)
+  // - Price pullback into MA20/MA50 zone (wider zone)
+  // - Reversal candle (Engulfing/Pinbar-like)
+  // - Volume spike confirmation
+  // - NO RSI divergence requirement
+
+  if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
+
+  const c15 = last(candles15);
+  if (!c15) return { ok: false, reason: 'MISSING_CANDLES' };
+
+  // Wider MA zone (default 1.0% ; configurable up to 1.2%)
+  const zone = Number(process.env.MA_ZONE_PCT ?? 0.01);
+  const maZonePct = Math.max(0.006, Math.min(zone, 0.02));
+  if (!inMaZone(c15, maZonePct)) return { ok: false, reason: 'NOT_AT_MA_ZONE', details: { maZonePct } };
+
+  const rev = isPullbackReversalCandle({ bias, candles15, candles30 });
+  if (!rev.ok) return { ok: false, reason: 'NO_REVERSAL_CANDLE', details: rev };
+
+  // LTF momentum: relaxed thresholds (default BUY>=45, SELL<=55)
+  const c5 = last(candles5);
+  if (c5?.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
+  const buyMin = Number(process.env.PULLBACK_RSI5_BUY_MIN ?? 45);
+  const sellMax = Number(process.env.PULLBACK_RSI5_SELL_MAX ?? 55);
+  if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, buyMin } };
+  if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, sellMax } };
+
+  // Volume spike required (default: 5m)
+  const lookback = Number(process.env.VOLUME_LOOKBACK ?? 20);
+  const mult = Number(process.env.VOLUME_MULT ?? 1.5);
+  const tf = String(process.env.PULLBACK_VOLUME_TF ?? '5m').toLowerCase();
+
+  const v5 = volumeSpikeOk(candles5, { lookback, mult });
+  const v15 = volumeSpikeOk(candles15, { lookback, mult });
+
+  if (tf === '5m' && !v5.ok) return { ok: false, reason: 'VOLUME_FILTER_5M', details: v5 };
+  if (tf === '15m' && !v15.ok) return { ok: false, reason: 'VOLUME_FILTER_15M', details: v15 };
+  if (tf === 'both' && (!v5.ok || !v15.ok)) return { ok: false, reason: 'VOLUME_FILTER_BOTH', details: { v5, v15 } };
+
+  return { ok: true, mode: 'PULLBACK', details: { maZonePct, reversal: rev.why, volume: tf === '15m' ? v15 : v5 } };
+}
+
 function maSlope(maArr, bars = 10) {
   const n = maArr.length;
   if (n < bars + 1) return null;
@@ -275,6 +339,11 @@ function rsiDivergence({ candles, rsiArr, type }) {
 
 export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
   const profile = (process.env.ANALYZE_PROFILE ?? 'strict').toLowerCase();
+  const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
+
+  if (strategy === 'PULLBACK_STRATEGY') {
+    return isEntrySignalPullback({ bias, candles30, candles15, candles5 });
+  }
 
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
@@ -321,16 +390,22 @@ export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
     }
 
     const div = rsiDivergence({ candles: candles15, rsiArr: rsi15, type: bias === 'BUY' ? 'BULL' : 'BEAR' });
+    // Divergence giữ nguyên cho profile scalp (có thể tắt bằng cách dùng PULLBACK_STRATEGY)
     if (!div.ok) return { ok: false, reason: 'SCALP_NO_RSI_DIVERGENCE' };
-    if (!inMaZone(c15, Number(process.env.SCALP_MA_ZONE_PCT ?? 0.006))) {
-      return { ok: false, reason: 'SCALP_NOT_AT_MA_ZONE' };
+
+    // Nới lỏng MA zone cho scalp: mặc định 1.0% (SCALP_MA_ZONE_PCT)
+    const z = Number(process.env.SCALP_MA_ZONE_PCT ?? process.env.MA_ZONE_PCT ?? 0.01);
+    const scalpZonePct = Math.max(0.006, Math.min(z, 0.02));
+    if (!inMaZone(c15, scalpZonePct)) {
+      return { ok: false, reason: 'SCALP_NOT_AT_MA_ZONE', details: { scalpZonePct } };
     }
 
+    // Giảm ngưỡng RSI momentum 5m cho scalp
     if (c5?.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
-    const buyMin = Number(process.env.SCALP_RSI5_BUY_MIN ?? 52);
-    const sellMax = Number(process.env.SCALP_RSI5_SELL_MAX ?? 48);
-    if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
-    if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
+    const buyMin = Number(process.env.SCALP_RSI5_BUY_MIN ?? process.env.RSI5_BUY_MIN ?? 50);
+    const sellMax = Number(process.env.SCALP_RSI5_SELL_MAX ?? process.env.RSI5_SELL_MAX ?? 50);
+    if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, buyMin } };
+    if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, sellMax } };
 
     const volEnabled = (process.env.VOLUME_FILTER_ENABLED ?? '1') === '1';
     if (volEnabled) {
@@ -407,13 +482,19 @@ export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
     return { ok: false, reason: 'NO_RSI_DIVERGENCE' };
   }
 
-  if (!inMaZone(c15, 0.006)) {
-    return { ok: false, reason: 'NOT_AT_MA_ZONE' };
+  // Nới lỏng MA zone theo yêu cầu: mặc định 1.0% (config qua env MA_ZONE_PCT)
+  const zone = Number(process.env.MA_ZONE_PCT ?? 0.01);
+  const maZonePct = Math.max(0.006, Math.min(zone, 0.02));
+  if (!inMaZone(c15, maZonePct)) {
+    return { ok: false, reason: 'NOT_AT_MA_ZONE', details: { maZonePct } };
   }
 
+  // Giảm ngưỡng RSI momentum 5m (config qua env RSI5_BUY_MIN / RSI5_SELL_MAX)
   if (c5.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
-  if (bias === 'BUY' && c5.rsi < 52) return { ok: false, reason: 'NO_LTF_MOMENTUM' };
-  if (bias === 'SELL' && c5.rsi > 48) return { ok: false, reason: 'NO_LTF_MOMENTUM' };
+  const buyMin = Number(process.env.RSI5_BUY_MIN ?? 50);
+  const sellMax = Number(process.env.RSI5_SELL_MAX ?? 50);
+  if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, buyMin } };
+  if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'NO_LTF_MOMENTUM', details: { rsi5: c5.rsi, sellMax } };
 
   const volEnabled = (process.env.VOLUME_FILTER_ENABLED ?? '1') === '1';
   if (volEnabled) {
