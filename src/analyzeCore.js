@@ -91,22 +91,37 @@ function wickRejectionOk({ bias, c5, c15 }) {
 }
 
 function isEntrySignalStackedTrend({ bias, candles15, candles5, candles1h }) {
-  // STACKED_TREND_STRATEGY (v4)
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
   const c15 = last(candles15);
   const c5 = last(candles5);
   if (!c15 || !c5) return { ok: false, reason: 'MISSING_CANDLES' };
 
-  if (c15.ma20 == null || c15.ma50 == null || c15.ma200 == null) {
-    return { ok: false, reason: 'MISSING_MA_15M' };
+  // 1. Giữ nguyên điều kiện nới lỏng poBuy/poSell bạn đã sửa
+  const poBuy = Number(c15.ma20) > Number(c15.ma50) && Number(c15.close) > Number(c15.ma200);
+  const poSell = Number(c15.ma20) < Number(c15.ma50) && Number(c15.close) < Number(c15.ma200);
+
+  if (bias === 'BUY' && !poBuy) return { ok: false, reason: 'PERFECT_ORDER_FAIL' };
+  if (bias === 'SELL' && !poSell) return { ok: false, reason: 'PERFECT_ORDER_FAIL' };
+
+  // --- ĐÂY LÀ PHẦN SỬA DUY NHẤT: THÊM BỘ LỌC ĐỘ DỐC ---
+  // Kiểm tra MA50 hiện tại so với 5 nến trước đó (khung 15m)
+  const lookback = 5;
+  if (candles15.length > lookback) {
+    const ma50Now = Number(c15.ma50);
+    const ma50Past = Number(candles15[candles15.length - 1 - lookback]?.ma50);
+
+    if (bias === 'SELL' && ma50Now >= ma50Past) {
+      // MA50 không dốc xuống -> Thị trường có thể đang hồi hoặc đi ngang
+      return { ok: false, reason: 'MA50_NOT_SLOPING_DOWN' };
+    }
+    
+    if (bias === 'BUY' && ma50Now <= ma50Past) {
+      // MA50 không dốc lên -> Bỏ qua lệnh BUY nhiễu
+      return { ok: false, reason: 'MA50_NOT_SLOPING_UP' };
+    }
   }
-
-  const poBuy = Number(c15.ma20) > Number(c15.ma50) && Number(c15.ma50) > Number(c15.ma200);
-  const poSell = Number(c15.ma20) < Number(c15.ma50) && Number(c15.ma50) < Number(c15.ma200);
-
-  if (bias === 'BUY' && !poBuy) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'BUY' } };
-  if (bias === 'SELL' && !poSell) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'SELL' } };
+  // ---------------------------------------------------
 
   const slopeBars = Number(process.env.STACKED_MA200_SLOPE_BARS ?? 30);
   const n = Math.max(3, Math.min(slopeBars, 50));
@@ -386,7 +401,17 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
   const trend1h = trendLabel(c1h ?? {});
 
   let bias = decideBias(trend1d, trend4h, trend1h);
-  if (bias === 'BUY') bias = 'WAIT';
+  // if (bias === 'BUY') bias = 'WAIT';
+  const htfEMA200 = c4h.ema200;
+  const currentPrice = c4h.close;
+
+  if (currentPrice > htfEMA200) {
+      // Xu hướng lớn là Tăng -> Chỉ cho phép BUY, chặn SELL
+      if (bias === 'SELL') bias = 'WAIT';
+  } else {
+      // Xu hướng lớn là Giảm -> Chỉ cho phép SELL, chặn BUY (Trạng thái hiện tại của Linh)
+      if (bias === 'BUY') bias = 'WAIT';
+  }
   let entryCheck = isEntrySignalV2({
     bias,
     candles30: data['30m'],
